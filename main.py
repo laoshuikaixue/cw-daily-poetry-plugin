@@ -1,6 +1,6 @@
 import time
 import requests
-from PyQt5.QtCore import Qt, QTimer, QPropertyAnimation, QEasingCurve, pyqtSignal
+from PyQt5.QtCore import Qt, QTimer, QPropertyAnimation, QEasingCurve, pyqtSignal, QThread
 from PyQt5.QtWidgets import QHBoxLayout, QLabel, QScrollArea, QWidget, QVBoxLayout, QScrollBar
 from loguru import logger
 from qfluentwidgets import isDarkTheme
@@ -10,13 +10,40 @@ WIDGET_NAME = '今日诗词 | LaoShui'
 WIDGET_WIDTH = 360
 API_URL = "https://api.codelife.cc/todayShici?lang=cn"
 
-# 模拟 Edge 浏览器的 User-Agent
 HEADERS = {
     'User-Agent': (
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36 '
-        'Edge/91.0.864.64'
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) '
+        'Chrome/91.0.4472.124 Safari/537.36 Edge/91.0.864.64'
     )
 }
+
+
+class PoetryFetchThread(QThread):
+    """诗词获取线程"""
+    fetch_success = pyqtSignal(dict)  # 成功信号
+    fetch_failed = pyqtSignal()  # 失败信号
+
+    def __init__(self):
+        super().__init__()
+        self.max_retries = 3
+
+    def run(self):
+        retry_count = 0
+        while retry_count < self.max_retries:
+            try:
+                response = requests.get(API_URL, headers=HEADERS, proxies={'http': None, 'https': None})
+                response.raise_for_status()
+                data = response.json().get("data", {})
+                if data:
+                    self.fetch_success.emit(data)
+                    return
+            except Exception as e:
+                logger.error(f"请求失败: {e}")
+
+            retry_count += 1
+            time.sleep(2)
+
+        self.fetch_failed.emit()
 
 
 class SmoothScrollBar(QScrollBar):
@@ -59,7 +86,8 @@ class SmoothScrollArea(QScrollArea):
         self.setStyleSheet("QScrollBar:vertical { width: 0px; }")  # 隐藏原始滚动条
 
     def wheelEvent(self, e):
-        self.vScrollBar.scrollValue(-e.angleDelta().y())
+        if hasattr(self.vScrollBar, 'scrollValue'):
+            self.vScrollBar.scrollValue(-e.angleDelta().y())
 
 
 class Plugin:
@@ -67,66 +95,80 @@ class Plugin:
         self.cw_contexts = cw_contexts
         self.method = method
 
-        self.CONFIG_PATH = f'{cw_contexts["PLUGIN_PATH"]}/config.json'
-        self.PATH = cw_contexts['PLUGIN_PATH']
-
         self.method.register_widget(WIDGET_CODE, WIDGET_NAME, WIDGET_WIDTH)
 
+        # 初始化滚动相关
         self.scroll_position = 0
-        self.timer = QTimer()
-        self.timer.timeout.connect(self.auto_scroll)
-        self.timer.start(150)  # 调整滚动速度
+        self.scroll_timer = QTimer()
+        self.scroll_timer.timeout.connect(self.auto_scroll)
+        self.scroll_timer.start(150)
 
-    @staticmethod
-    def fetch_poetry():
-        """请求诗词接口并获取数据，带重试机制"""
-        retry_count = 0
-        max_retries = 3
-        while retry_count < max_retries:
-            try:
-                response = requests.get(API_URL, headers=HEADERS, proxies={'http': None, 'https': None})
-                logger.debug(f"API 请求成功，状态码: {response.status_code}")
-                response.raise_for_status()
-                data = response.json().get("data", {})
-                if data:
-                    return data
-                else:
-                    logger.warning("API 返回的数据为空，正在重试...")
-            except requests.RequestException as e:
-                logger.error(f"请求诗词信息失败: {e}")
+        # 初始化数据
+        self.default_content = {
+            "content": "正在加载诗词...",
+            "author": "系统",
+            "title": "加载中",
+            "dynasty": "请稍候",
+            "translate": "正在从服务器获取数据"
+        }
 
-            retry_count += 1
-            time.sleep(2)
+        # 首次加载
+        self.update_poetry()
 
-        # 如果3次重试都失败，则等待5分钟后再尝试
-        logger.warning(f"重试 {max_retries} 次失败，等待5分钟后再试...")
-        QTimer.singleShot(5 * 60 * 1000, lambda: Plugin.fetch_poetry())
-        return None
+        # 定时刷新（每2小时）
+        self.refresh_timer = QTimer()
+        self.refresh_timer.timeout.connect(self.update_poetry)
+        self.refresh_timer.start(2 * 60 * 60 * 1000)
 
     def update_poetry(self):
-        """更新诗词"""
-        poetry_data = self.fetch_poetry()
-        if poetry_data:
-            # 提取具体内容
-            content = poetry_data.get("quotes", "无法获取诗词信息。")
-            title = poetry_data.get("title", "未知标题")
-            author = poetry_data.get("author", "未知作者")
-            dynasty = poetry_data.get("dynasty", "未知朝代")
-            translate = "翻译：" + poetry_data.get("translate", "未知翻译")
-            annotation = poetry_data.get("annotation", "未知注释")
-            preface = poetry_data.get("preface", "未知序言")
-            reviews = poetry_data.get("reviews", "未知评论")
+        """启动异步更新"""
+        self._show_loading()
+        self.worker_thread = PoetryFetchThread()
+        self.worker_thread.fetch_success.connect(self.handle_success)
+        self.worker_thread.fetch_failed.connect(self.handle_failure)
+        self.worker_thread.start()
 
-            # 更新小组件内容
-            self.update_widget_content(content, author, title, dynasty, translate)
-        else:
-            # 如果获取失败，显示默认内容
-            self.update_widget_content("无法获取诗词信息，请稍后再试。", "未知作者", "未知标题", "未知朝代", "未知翻译")
+    def _show_loading(self):
+        """显示加载状态"""
+        self._update_ui(self.default_content)
+
+    def handle_success(self, data):
+        """处理成功响应"""
+        content = {
+            "content": data.get("quotes", "无法获取诗词内容"),
+            "author": data.get("author", "未知作者"),
+            "title": data.get("title", "未知标题"),
+            "dynasty": data.get("dynasty", "未知朝代"),
+            "translate": "翻译：" + data.get("translate", "暂无翻译")
+        }
+        self._update_ui(content)
+
+    def handle_failure(self):
+        """处理失败情况"""
+        error_content = {
+            "content": "数据获取失败",
+            "author": "系统",
+            "title": "错误",
+            "dynasty": "5分钟后重试",
+            "translate": "请检查网络连接"
+        }
+        self._update_ui(error_content)
+        QTimer.singleShot(5 * 60 * 1000, self.update_poetry)
+
+    def _update_ui(self, content):
+        """线程安全更新界面"""
+        QTimer.singleShot(0, lambda: self.update_widget_content(
+            content["content"],
+            content["author"],
+            content["title"],
+            content["dynasty"],
+            content["translate"]
+        ))
 
     def update_widget_content(self, content, author, title, dynasty, translate):
         """更新小组件内容"""
         self.test_widget = self.method.get_widget(WIDGET_CODE)
-        if not self.test_widget:  # 如果test_widget为空
+        if not self.test_widget:
             logger.error(f"小组件未找到，WIDGET_CODE: {WIDGET_CODE}")
             return
 
@@ -224,13 +266,13 @@ class Plugin:
         # 查找 SmoothScrollArea
         scroll_area = self.test_widget.findChild(SmoothScrollArea)
         if not scroll_area:
-            logger.warning("无法找到 SmoothScrollArea，停止自动滚动")
+            # logger.warning("无法找到 SmoothScrollArea，停止自动滚动") 实际使用不加log不然有错日志就被刷爆了
             return
 
         # 查找滚动条
         vertical_scrollbar = scroll_area.verticalScrollBar()
         if not vertical_scrollbar:
-            logger.warning("无法找到垂直滚动条，停止自动滚动")
+            # logger.warning("无法找到垂直滚动条，停止自动滚动") 实际使用不加log不然有错日志就被刷爆了
             return
 
         # 执行滚动逻辑
@@ -243,5 +285,5 @@ class Plugin:
         vertical_scrollbar.setValue(self.scroll_position)
 
     def execute(self):
-        """首次执行，加载诗词数据"""
+        """首次执行"""
         self.update_poetry()
