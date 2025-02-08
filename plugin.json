@@ -1,7 +1,7 @@
 {
     "name": "今日诗词",
     "description": "每天一句诗词名句。",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "plugin_ver": 1,
     "author": "LaoShui",
     "settings": false,
@@ -9,5 +9,5 @@
     "url": "https://github.com/laoshuikaixue/cw-daily-poetry-plugin",
     "branch": "main",
 
-    "update_date": "2025/01/15"
+    "update_date": "2025/02/08"
 }
